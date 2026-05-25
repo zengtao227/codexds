@@ -7,6 +7,26 @@ _CODEXDS_MB_CONFIG="${CODEXDS_MOONBRIDGE_CONFIG:-$HOME/moon-bridge/config.yml}"
 _CODEXDS_HOME="${CODEXDS_HOME:-$HOME/.dscodex}"
 _CODEXDS_MB_URL="${CODEXDS_MOONBRIDGE_URL:-http://127.0.0.1:38440}"
 _CODEXDS_KEY_FILE="$_CODEXDS_HOME/ds.key"
+# Codex CLI 的已知默认路径（不依赖 PATH）
+_CODEXDS_CODEX_APP_BIN="/Applications/Codex.app/Contents/Resources/codex"
+
+# ── Codex CLI 查找 ────────────────────────────────────────────
+
+_codexds_find_codex() {
+    # 1. 环境变量覆盖
+    if [[ -n "${CODEXDS_CODEX_BIN:-}" && -x "$CODEXDS_CODEX_BIN" ]]; then
+        echo "$CODEXDS_CODEX_BIN"; return 0
+    fi
+    # 2. PATH 中查找
+    if command -v codex &>/dev/null; then
+        command -v codex; return 0
+    fi
+    # 3. Codex.app bundle 默认位置（macOS 标准安装）
+    if [[ -x "$_CODEXDS_CODEX_APP_BIN" ]]; then
+        echo "$_CODEXDS_CODEX_APP_BIN"; return 0
+    fi
+    return 1
+}
 
 # ── Moon Bridge 管理 ───────────────────────────────────────────
 
@@ -227,6 +247,12 @@ codexds() {
     _codexds_ensure_config || return 1
 
     # 4. 启动 Codex（独立 CODEX_HOME，不干扰 ~/.codex）
+    local _codex_bin
+    _codex_bin=$(_codexds_find_codex) || {
+        echo "[codexds] ✗ 未找到 codex CLI"
+        echo "         请安装 Codex.app 或设置 CODEXDS_CODEX_BIN 指向二进制路径"
+        return 1
+    }
     echo "[codexds] 启动 Codex (DeepSeek V4 Pro)..."
-    CODEX_HOME="$_CODEXDS_HOME" command codex "$@"
+    CODEX_HOME="$_CODEXDS_HOME" "$_codex_bin" "$@"
 }

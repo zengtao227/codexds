@@ -7,9 +7,14 @@ ZSHRC="$HOME/.zshrc"
 
 echo "=== codexds installer ==="
 
-# 检查依赖
-if ! command -v codex > /dev/null 2>&1; then
-    echo "✗ 未找到 codex CLI，请先安装 Codex"
+# 检查依赖：codex CLI（PATH 优先，fallback 到 App bundle）
+_CODEX_APP_BIN="/Applications/Codex.app/Contents/Resources/codex"
+if command -v codex > /dev/null 2>&1; then
+    echo "✓ codex CLI 已找到（PATH）：$(command -v codex)"
+elif [[ -x "$_CODEX_APP_BIN" ]]; then
+    echo "✓ codex CLI 已找到（App bundle）：$_CODEX_APP_BIN"
+else
+    echo "✗ 未找到 codex CLI，请先安装 Codex.app 或设置 CODEXDS_CODEX_BIN"
     exit 1
 fi
 
@@ -20,7 +25,6 @@ if [[ ! -x "$MB_BIN" ]]; then
     exit 1
 fi
 
-echo "✓ codex CLI 已找到：$(which codex)"
 echo "✓ Moon Bridge 已找到：$MB_BIN"
 
 # 添加 source 行（去重）
