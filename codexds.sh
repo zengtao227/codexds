@@ -191,24 +191,24 @@ _codexds_cmd_key() {
 
 _codexds_ensure_config() {
     local config_file="$_CODEXDS_HOME/config.toml"
-
-    # 已有配置则跳过
-    [[ -f "$config_file" ]] && return 0
-
-    echo "[codexds] 生成 Codex 配置..."
     mkdir -p "$_CODEXDS_HOME"
 
-    # 用 Moon Bridge 内置生成器（同时生成 models_catalog.json）
-    "$_CODEXDS_BIN" \
-        -config "$_CODEXDS_MB_CONFIG" \
-        -print-codex-config "gpt-5.4" \
-        -codex-base-url "$_CODEXDS_MB_URL/v1" \
-        -codex-home "$_CODEXDS_HOME" \
-        > "$config_file" 2>/dev/null
+    # config.toml 只生成一次；models_catalog.json 每次刷新（路由可能新增）
+    local need_config=false
+    [[ ! -s "$config_file" ]] && need_config=true
 
-    # 如果生成失败则写入兜底配置
-    if [[ ! -s "$config_file" ]]; then
-        cat > "$config_file" << TOML
+    if $need_config; then
+        echo "[codexds] 生成 Codex 配置..."
+        "$_CODEXDS_BIN" \
+            -config "$_CODEXDS_MB_CONFIG" \
+            -print-codex-config "gpt-5.4" \
+            -codex-base-url "$_CODEXDS_MB_URL/v1" \
+            -codex-home "$_CODEXDS_HOME" \
+            > "$config_file" 2>/dev/null
+
+        # 兜底配置（Moon Bridge 未响应时）
+        if [[ ! -s "$config_file" ]]; then
+            cat > "$config_file" << TOML
 model = "gpt-5.4"
 model_reasoning_effort = "high"
 model_catalog_json = "$_CODEXDS_HOME/models_catalog.json"
@@ -220,9 +220,17 @@ api_key = "codexds-local"
 [features]
 multi_agent = true
 TOML
+        fi
+        echo "[codexds] ✓ 配置已生成"
+    else
+        # 每次启动刷新 catalog（静默，不覆盖 config.toml）
+        "$_CODEXDS_BIN" \
+            -config "$_CODEXDS_MB_CONFIG" \
+            -print-codex-config "gpt-5.4" \
+            -codex-base-url "$_CODEXDS_MB_URL/v1" \
+            -codex-home "$_CODEXDS_HOME" \
+            > /dev/null 2>&1 || true
     fi
-
-    echo "[codexds] ✓ 配置已生成"
 }
 
 # ── 主函数 ────────────────────────────────────────────────────
