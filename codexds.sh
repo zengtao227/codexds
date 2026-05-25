@@ -1,43 +1,42 @@
 #!/usr/bin/env bash
 # codexds — 无需 OpenAI 账号的 Codex CLI 封装，调用 DeepSeek 通过 Moon Bridge
+# 架构：Codex → 工具拦截层(:8383) → Moon Bridge(:38440) → DeepSeek
 
-# ── 配置（可通过环境变量覆盖）────────────────────────────────
+# ── 配置（可通过环境变量覆盖）────────────────────────────────────
 _CODEXDS_BIN="${CODEXDS_MOONBRIDGE_BIN:-$HOME/bin/moonbridge}"
 _CODEXDS_MB_CONFIG="${CODEXDS_MOONBRIDGE_CONFIG:-$HOME/moon-bridge/config.yml}"
 _CODEXDS_HOME="${CODEXDS_HOME:-$HOME/.dscodex}"
 _CODEXDS_MB_URL="${CODEXDS_MOONBRIDGE_URL:-http://127.0.0.1:38440}"
+_CODEXDS_INTERCEPTOR_PORT="${CODEXDS_INTERCEPTOR_PORT:-8383}"
+_CODEXDS_INTERCEPTOR_URL="http://127.0.0.1:${_CODEXDS_INTERCEPTOR_PORT}"
 _CODEXDS_KEY_FILE="$_CODEXDS_HOME/ds.key"
-# Codex CLI 的已知默认路径（不依赖 PATH）
 _CODEXDS_CODEX_APP_BIN="/Applications/Codex.app/Contents/Resources/codex"
+# 脚本自身所在目录（source 时解析）
+_CODEXDS_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
 
-# ── Codex CLI 查找 ────────────────────────────────────────────
+# ── Codex CLI 查找 ────────────────────────────────────────────────
 
 _codexds_find_codex() {
-    # 1. 环境变量覆盖
     if [[ -n "${CODEXDS_CODEX_BIN:-}" && -x "$CODEXDS_CODEX_BIN" ]]; then
         echo "$CODEXDS_CODEX_BIN"; return 0
     fi
-    # 2. PATH 中查找
     if command -v codex &>/dev/null; then
         command -v codex; return 0
     fi
-    # 3. Codex.app bundle 默认位置（macOS 标准安装）
     if [[ -x "$_CODEXDS_CODEX_APP_BIN" ]]; then
         echo "$_CODEXDS_CODEX_APP_BIN"; return 0
     fi
     return 1
 }
 
-# ── Moon Bridge 管理 ───────────────────────────────────────────
+# ── Moon Bridge 管理 ──────────────────────────────────────────────
 
 _codexds_mb_running() {
-    curl -sf "$_CODEXDS_MB_URL/v1/models" > /dev/null 2>&1
+    curl -sf --max-time 3 "$_CODEXDS_MB_URL/v1/models" > /dev/null 2>&1
 }
 
 _codexds_ensure_moonbridge() {
-    if _codexds_mb_running; then
-        return 0
-    fi
+    if _codexds_mb_running; then return 0; fi
 
     if [[ ! -x "$_CODEXDS_BIN" ]]; then
         echo "[codexds] ✗ Moon Bridge 未找到：$_CODEXDS_BIN"
@@ -51,10 +50,7 @@ _codexds_ensure_moonbridge() {
     local i=0
     while (( i < 20 )); do
         sleep 0.3
-        if _codexds_mb_running; then
-            echo "[codexds] ✓ Moon Bridge 已启动"
-            return 0
-        fi
+        if _codexds_mb_running; then echo "[codexds] ✓ Moon Bridge 已启动"; return 0; fi
         (( i++ ))
     done
 
@@ -62,7 +58,46 @@ _codexds_ensure_moonbridge() {
     return 1
 }
 
-# ── DeepSeek Key 管理 ─────────────────────────────────────────
+# ── 工具拦截层管理 ────────────────────────────────────────────────
+
+_codexds_interceptor_running() {
+    curl -sf --max-time 2 "$_CODEXDS_INTERCEPTOR_URL/v1/models" > /dev/null 2>&1
+}
+
+_codexds_ensure_interceptor() {
+    local interceptor_script="$_CODEXDS_SCRIPT_DIR/interceptor/server.mjs"
+
+    if ! command -v node &>/dev/null; then
+        echo "[codexds] ⚠ Node.js 未找到，web_search 功能不可用（Codex 直连 Moon Bridge）"
+        return 0
+    fi
+
+    if [[ ! -f "$interceptor_script" ]]; then
+        echo "[codexds] ⚠ 拦截层脚本未找到：$interceptor_script"
+        return 0
+    fi
+
+    if _codexds_interceptor_running; then return 0; fi
+
+    echo "[codexds] 启动工具拦截层..."
+    MB_URL="$_CODEXDS_MB_URL" INTERCEPTOR_PORT="$_CODEXDS_INTERCEPTOR_PORT" \
+        node "$interceptor_script" > /dev/null 2>&1 &
+
+    local i=0
+    while (( i < 20 )); do
+        sleep 0.3
+        if _codexds_interceptor_running; then
+            echo "[codexds] ✓ 工具拦截层已启动（web_search / web_fetch 本地执行）"
+            return 0
+        fi
+        (( i++ ))
+    done
+
+    echo "[codexds] ⚠ 工具拦截层启动超时，降级为直连 Moon Bridge"
+    return 0  # 非致命错误
+}
+
+# ── DeepSeek Key 管理 ─────────────────────────────────────────────
 
 _codexds_validate_key() {
     local key="$1"
@@ -80,17 +115,18 @@ _codexds_save_key() {
     echo "$key" > "$_CODEXDS_KEY_FILE"
     chmod 600 "$_CODEXDS_KEY_FILE"
 
-    # Keep Moon Bridge in sync without touching the isolated Codex key file.
     if [[ -f "$_CODEXDS_MB_CONFIG" ]]; then
-        sed -i '' -E "s/api_key: \"sk-[^\"]*\"/api_key: \"$key\"/" \
-            "$_CODEXDS_MB_CONFIG"
+        sed -i.bak -E "s/api_key: \"sk-[^\"]*\"/api_key: \"$key\"/" \
+            "$_CODEXDS_MB_CONFIG" && rm -f "${_CODEXDS_MB_CONFIG}.bak"
     fi
 }
 
 _codexds_restart_moonbridge() {
     pkill -f "moonbridge.*config" > /dev/null 2>&1
+    pkill -f "interceptor/server.mjs" > /dev/null 2>&1
     sleep 0.5
     _codexds_ensure_moonbridge
+    _codexds_ensure_interceptor
 }
 
 _codexds_prompt_key() {
@@ -100,10 +136,7 @@ _codexds_prompt_key() {
     local new_key
     read -r new_key
 
-    if [[ -z "$new_key" ]]; then
-        echo "[codexds] ✗ Key 不能为空"
-        return 1
-    fi
+    if [[ -z "$new_key" ]]; then echo "[codexds] ✗ Key 不能为空"; return 1; fi
 
     echo "[codexds] 验证 Key..."
     if ! _codexds_validate_key "$new_key"; then
@@ -118,7 +151,6 @@ _codexds_prompt_key() {
 }
 
 _codexds_ensure_key() {
-    # 无 Key 文件 → 首次运行
     if [[ ! -f "$_CODEXDS_KEY_FILE" ]]; then
         _codexds_prompt_key "[codexds] 首次使用，请输入 DeepSeek API Key：" || return 1
         return 0
@@ -126,37 +158,25 @@ _codexds_ensure_key() {
 
     local key
     key=$(<"$_CODEXDS_KEY_FILE")
+    if _codexds_validate_key "$key"; then return 0; fi
 
-    # 有 Key，验证是否有效
-    if _codexds_validate_key "$key"; then
-        return 0
-    fi
-
-    # Key 失效 → 提示更新
     _codexds_prompt_key "[codexds] ✗ DeepSeek Key 已失效，请输入新 Key：" || return 1
 }
 
 _codexds_mask_key() {
     local key="$1"
     local length=${#key}
-    if (( length <= 10 )); then
-        printf "%s\n" "******"
-        return 0
-    fi
-
-    local prefix
-    local suffix
+    if (( length <= 10 )); then printf "%s\n" "******"; return 0; fi
+    local prefix suffix
     prefix=$(printf "%s" "$key" | cut -c1-6)
     suffix=$(printf "%s" "$key" | rev | cut -c1-4 | rev)
     printf "%s...%s\n" "$prefix" "$suffix"
 }
 
-# --key 入口：主动更换 Key
 _codexds_cmd_key() {
     if [[ -f "$_CODEXDS_KEY_FILE" ]]; then
-        local current
+        local current masked
         current=$(<"$_CODEXDS_KEY_FILE")
-        local masked
         masked=$(_codexds_mask_key "$current")
         echo "[codexds] 当前 Key：$masked"
     else
@@ -167,33 +187,35 @@ _codexds_cmd_key() {
     local new_key
     read -r new_key
 
-    if [[ -z "$new_key" ]]; then
-        echo "[codexds] 已取消"
-        return 0
-    fi
+    if [[ -z "$new_key" ]]; then echo "[codexds] 已取消"; return 0; fi
 
     echo "[codexds] 验证新 Key..."
-    if ! _codexds_validate_key "$new_key"; then
-        echo "[codexds] ✗ 验证失败"
-        return 1
-    fi
+    if ! _codexds_validate_key "$new_key"; then echo "[codexds] ✗ 验证失败"; return 1; fi
 
     _codexds_save_key "$new_key"
     echo "[codexds] ✓ Key 已更新"
 
     if _codexds_mb_running; then
-        echo "[codexds] 重启 Moon Bridge 使新 Key 生效..."
+        echo "[codexds] 重启服务使新 Key 生效..."
         _codexds_restart_moonbridge
     fi
 }
 
-# ── Codex 配置生成 ────────────────────────────────────────────
+# ── Codex 配置生成 ────────────────────────────────────────────────
+
+_codexds_endpoint_url() {
+    # 拦截层在线 → 用拦截层；否则直连 Moon Bridge
+    if _codexds_interceptor_running; then
+        echo "$_CODEXDS_INTERCEPTOR_URL"
+    else
+        echo "$_CODEXDS_MB_URL"
+    fi
+}
 
 _codexds_ensure_config() {
     local config_file="$_CODEXDS_HOME/config.toml"
     mkdir -p "$_CODEXDS_HOME"
 
-    # config.toml 只生成一次；models_catalog.json 每次刷新（路由可能新增）
     local need_config=false
     [[ ! -s "$config_file" ]] && need_config=true
 
@@ -206,16 +228,16 @@ _codexds_ensure_config() {
             -codex-home "$_CODEXDS_HOME" \
             > "$config_file" 2>/dev/null
 
-        # 兜底配置（Moon Bridge 未响应时）
         if [[ ! -s "$config_file" ]]; then
             cat > "$config_file" << TOML
 model = "gpt-5.4"
 model_reasoning_effort = "high"
 model_catalog_json = "$_CODEXDS_HOME/models_catalog.json"
 
-[openai]
+[model_providers.moonbridge]
+name = "Moon Bridge"
 base_url = "$_CODEXDS_MB_URL/v1"
-api_key = "codexds-local"
+wire_api = "responses"
 
 [features]
 multi_agent = true
@@ -223,7 +245,7 @@ TOML
         fi
         echo "[codexds] ✓ 配置已生成"
     else
-        # 每次启动刷新 catalog（静默，不覆盖 config.toml）
+        # 每次刷新 catalog（静默）
         "$_CODEXDS_BIN" \
             -config "$_CODEXDS_MB_CONFIG" \
             -print-codex-config "gpt-5.4" \
@@ -231,31 +253,36 @@ TOML
             -codex-home "$_CODEXDS_HOME" \
             > /dev/null 2>&1 || true
     fi
+
+    # 将 base_url 更新为实际端点（拦截层或 Moon Bridge）
+    local endpoint
+    endpoint=$(_codexds_endpoint_url)
+    sed -i.bak "s|base_url = \"http://127.0.0.1:[0-9]*/v1\"|base_url = \"${endpoint}/v1\"|g" \
+        "$config_file" && rm -f "${config_file}.bak"
 }
 
-# ── 主函数 ────────────────────────────────────────────────────
+# ── 主函数 ────────────────────────────────────────────────────────
 
 codexds() {
-    # 处理 --key 标志
     if [[ "${1:-}" == "--key" ]]; then
-        _codexds_cmd_key
-        return $?
+        _codexds_cmd_key; return $?
     fi
 
-    # 创建隔离目录
     mkdir -p "$_CODEXDS_HOME"
 
-    # 1. 确保 Key 有效（首次提示 / 失效重提示）
+    # 1. 确保 Key 有效
     _codexds_ensure_key || return 1
 
     # 2. 确保 Moon Bridge 运行
     _codexds_ensure_moonbridge || return 1
 
-    # 3. 确保 Codex 配置存在
-    _codexds_ensure_config || return 1
+    # 3. 启动工具拦截层（有 Node.js 时）
+    _codexds_ensure_interceptor
 
-    # 4. 检测目录冲突：从 $HOME 启动时 ~/.codex/config.toml 会被当成项目级 config
-    #    覆盖 CODEX_HOME 的 model_catalog_json，导致 catalog 只剩官方模型
+    # 4. 确保 Codex 配置存在并指向正确端点
+    _codexds_ensure_config
+
+    # 5. 检测 home 目录冲突
     local _launch_dir="$PWD"
     if [[ "$_launch_dir" == "$HOME" ]]; then
         local _workspace="$_CODEXDS_HOME/workspace"
@@ -265,13 +292,13 @@ codexds() {
         _launch_dir="$_workspace"
     fi
 
-    # 5. 启动 Codex（独立 CODEX_HOME，不干扰 ~/.codex）
+    # 6. 启动 Codex
     local _codex_bin
     _codex_bin=$(_codexds_find_codex) || {
         echo "[codexds] ✗ 未找到 codex CLI"
         echo "         请安装 Codex.app 或设置 CODEXDS_CODEX_BIN 指向二进制路径"
         return 1
     }
-    echo "[codexds] 启动 Codex (DeepSeek V4 Pro)..."
+    echo "[codexds] 启动 Codex (DeepSeek)..."
     CODEX_HOME="$_CODEXDS_HOME" "$_codex_bin" --cd "$_launch_dir" "$@"
 }

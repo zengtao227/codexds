@@ -1,10 +1,13 @@
 # codexds.ps1 — Windows PowerShell equivalent of codexds.sh
 
-$_CODEXDS_MB_BIN    = if ($env:CODEXDS_MOONBRIDGE_BIN)    { $env:CODEXDS_MOONBRIDGE_BIN }    else { "$env:USERPROFILE\bin\moonbridge.exe" }
-$_CODEXDS_MB_CONFIG = if ($env:CODEXDS_MOONBRIDGE_CONFIG) { $env:CODEXDS_MOONBRIDGE_CONFIG } else { "$env:USERPROFILE\moon-bridge\config.yml" }
-$_CODEXDS_HOME      = if ($env:CODEXDS_HOME)              { $env:CODEXDS_HOME }              else { "$env:APPDATA\dscodex" }
-$_CODEXDS_MB_URL    = if ($env:CODEXDS_MOONBRIDGE_URL)    { $env:CODEXDS_MOONBRIDGE_URL }    else { "http://127.0.0.1:38440" }
-$_CODEXDS_KEY_FILE  = "$_CODEXDS_HOME\ds.key"
+$_CODEXDS_MB_BIN          = if ($env:CODEXDS_MOONBRIDGE_BIN)    { $env:CODEXDS_MOONBRIDGE_BIN }    else { "$env:USERPROFILE\bin\moonbridge.exe" }
+$_CODEXDS_MB_CONFIG       = if ($env:CODEXDS_MOONBRIDGE_CONFIG) { $env:CODEXDS_MOONBRIDGE_CONFIG } else { "$env:USERPROFILE\moon-bridge\config.yml" }
+$_CODEXDS_HOME            = if ($env:CODEXDS_HOME)              { $env:CODEXDS_HOME }              else { "$env:APPDATA\dscodex" }
+$_CODEXDS_MB_URL          = if ($env:CODEXDS_MOONBRIDGE_URL)    { $env:CODEXDS_MOONBRIDGE_URL }    else { "http://127.0.0.1:38440" }
+$_CODEXDS_INTERCEPTOR_PORT = if ($env:CODEXDS_INTERCEPTOR_PORT) { $env:CODEXDS_INTERCEPTOR_PORT }  else { "8383" }
+$_CODEXDS_INTERCEPTOR_URL = "http://127.0.0.1:$_CODEXDS_INTERCEPTOR_PORT"
+$_CODEXDS_KEY_FILE        = "$_CODEXDS_HOME\ds.key"
+$_CODEXDS_SCRIPT_DIR      = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -56,10 +59,45 @@ function _codexds_mask_key($key) {
     return "$($key.Substring(0,6))...$($key.Substring($key.Length-4))"
 }
 
+function _codexds_interceptor_running {
+    try {
+        $r = Invoke-WebRequest -Uri "$_CODEXDS_INTERCEPTOR_URL/v1/models" -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
+        return $r.StatusCode -eq 200
+    } catch { return $false }
+}
+
+function _codexds_ensure_interceptor {
+    $node = Get-Command node -ErrorAction SilentlyContinue
+    if (-not $node) {
+        Write-Host "[codexds] ⚠ Node.js 未找到，web_search 功能不可用（直连 Moon Bridge）"
+        return
+    }
+    $script = Join-Path $_CODEXDS_SCRIPT_DIR "interceptor\server.mjs"
+    if (-not (Test-Path $script)) {
+        Write-Host "[codexds] ⚠ 拦截层未找到：$script"
+        return
+    }
+    if (_codexds_interceptor_running) { return }
+    Write-Host "[codexds] 启动工具拦截层..."
+    $env:MB_URL = $_CODEXDS_MB_URL
+    $env:INTERCEPTOR_PORT = $_CODEXDS_INTERCEPTOR_PORT
+    Start-Process -FilePath $node.Source -ArgumentList $script -WindowStyle Hidden
+    for ($i = 0; $i -lt 20; $i++) {
+        Start-Sleep -Milliseconds 300
+        if (_codexds_interceptor_running) {
+            Write-Host "[codexds] ✓ 工具拦截层已启动（web_search / web_fetch 本地执行）"
+            return
+        }
+    }
+    Write-Host "[codexds] ⚠ 工具拦截层启动超时，降级为直连 Moon Bridge"
+}
+
 function _codexds_restart_moonbridge {
     Get-Process -Name "moonbridge" -ErrorAction SilentlyContinue | Stop-Process -Force
+    Get-Process -Name "node" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like "*interceptor*" } | Stop-Process -Force
     Start-Sleep -Milliseconds 500
     _codexds_ensure_moonbridge | Out-Null
+    _codexds_ensure_interceptor
 }
 
 function _codexds_prompt_key($promptMsg) {
@@ -147,6 +185,7 @@ function codexds {
 
     if (-not (_codexds_ensure_key))       { return }
     if (-not (_codexds_ensure_moonbridge)) { return }
+    _codexds_ensure_interceptor
     _codexds_ensure_config
 
     $launchDir = $PWD.Path
