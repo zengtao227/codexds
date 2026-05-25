@@ -1,6 +1,8 @@
 # codexds
 
-无需 OpenAI 账号的 Codex CLI 封装，底层调用 DeepSeek API。
+**工具与模型解耦。** Codex 是 harness，DeepSeek 是 intelligence——你不应该因为选择了一个工具就被绑定在一个模型上。
+
+codexds 让你用 DeepSeek API 驱动 Codex CLI，无需 OpenAI 账号，不干扰已有的 Codex 登录实例，两者可以同时运行。
 
 ## 安装
 
