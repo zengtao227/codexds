@@ -254,7 +254,18 @@ codexds() {
     # 3. 确保 Codex 配置存在
     _codexds_ensure_config || return 1
 
-    # 4. 启动 Codex（独立 CODEX_HOME，不干扰 ~/.codex）
+    # 4. 检测目录冲突：从 $HOME 启动时 ~/.codex/config.toml 会被当成项目级 config
+    #    覆盖 CODEX_HOME 的 model_catalog_json，导致 catalog 只剩官方模型
+    local _launch_dir="$PWD"
+    if [[ "$_launch_dir" == "$HOME" ]]; then
+        local _workspace="$_CODEXDS_HOME/workspace"
+        mkdir -p "$_workspace"
+        echo "[codexds] ⚠ 检测到 home 目录冲突，已切换至安全工作区 $_workspace"
+        echo "         提示：在项目目录下运行 codexds 可直接使用当前目录"
+        _launch_dir="$_workspace"
+    fi
+
+    # 5. 启动 Codex（独立 CODEX_HOME，不干扰 ~/.codex）
     local _codex_bin
     _codex_bin=$(_codexds_find_codex) || {
         echo "[codexds] ✗ 未找到 codex CLI"
@@ -262,5 +273,5 @@ codexds() {
         return 1
     }
     echo "[codexds] 启动 Codex (DeepSeek V4 Pro)..."
-    CODEX_HOME="$_CODEXDS_HOME" "$_codex_bin" "$@"
+    CODEX_HOME="$_CODEXDS_HOME" "$_codex_bin" --cd "$_launch_dir" "$@"
 }
